@@ -1,0 +1,17 @@
+venv_antonia/
+models/
+logs/
+__pycache__/
+*.pyc
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+
+# Archivos de audio
+*.wav
+*.mp3
+*.flac
+
+# Archivos de configuración sensible
+.env
