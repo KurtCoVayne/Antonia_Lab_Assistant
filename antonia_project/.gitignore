@@ -1,0 +1,5 @@
+venv_antonia/
+models/
+logs/
+__pycache__/
+*.pyc
