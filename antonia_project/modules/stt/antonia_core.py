@@ -230,7 +230,7 @@ def main_loop():
     with sd.InputStream(
         samplerate=SR_HW,
         channels=1,
-        dtype="float32",
+        dtype="float32",    
         blocksize=CHUNK_SAMPLES,
         device=MIC_DEVICE,
         latency="high",

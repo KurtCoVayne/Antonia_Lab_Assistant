@@ -4,19 +4,20 @@ Proyecto Antonia — EAFIT
 Prueba y benchmark de Whisper con micrófono USB a 44100 Hz.
 Hardware: Jetson Orin Nano 8GB | Micrófono USB (device 0)
 """
-
-import time
 import sounddevice as sd
 import numpy as np
 import librosa
 from faster_whisper import WhisperModel
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import time
 
 # ══════════════════════════════════════════════════════════════
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════
 MODEL_SIZE  = "small"   # Opciones: "tiny" | "base" | "small"
 DEVICE      = "cuda"    # GPU de la Jetson
-COMPUTE     = "int8"    # Cuantización INT8 — menor RAM, igual precisión
+COMPUTE     = "float16"    # Cuantización INT8 — menor RAM, igual precisión
 MIC_DEVICE  = 0         # ID del micrófono USB (verificar con: python -m sounddevice)
 SR_HW       = 44100     # Sample rate nativo del micrófono USB
 SR_WHISPER  = 16000     # Sample rate requerido por Whisper
@@ -33,7 +34,8 @@ model = WhisperModel(
     MODEL_SIZE,
     device=DEVICE,
     compute_type=COMPUTE,
-    num_workers=2,          # Paralelismo en decodificación
+    device_index=0,
+    num_workers=1,          # Paralelismo en decodificación
     cpu_threads=4,          # Hilos CPU para pre/post-procesado
 )
 print(f"[INIT] Modelo listo en {time.time() - t_load:.2f}s\n")

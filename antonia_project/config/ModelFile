@@ -1,0 +1,28 @@
+# config/Modelfile — Ejecutar: ollama create antonia-llm -f config/Modelfile
+# (dentro del contenedor Docker: docker exec -it ollama_antonia ollama create...)
+ 
+FROM qwen2.5:1.5b
+ 
+# Contexto: 1024 tokens — calibrado para evitar expansión del KV Cache
+# No subir: a mayor contexto, mayor VRAM dinámica → riesgo de OOM
+PARAMETER num_ctx 1024
+ 
+# Temperatura: 0.1 — casi determinista, mínimas alucinaciones
+# Qwen 2.5 1.5B necesita temperatura más baja que modelos grandes
+PARAMETER temperature 0.1
+ 
+# top_p acotado: evita tokens improbables que generan texto inventado
+PARAMETER top_p 0.8
+ 
+# Penaliza repetición — Qwen 1.5B tiende a loops en respuestas largas
+PARAMETER repeat_penalty 1.15
+ 
+# Máximo de tokens: 120 = ~3 oraciones cortas en español
+# Mantener bajo: reduce latencia y evita que el modelo se extienda
+PARAMETER num_predict 120
+ 
+# Threads de CPU para operaciones no-GPU del modelo
+PARAMETER num_thread 4
+ 
+# NOTA: KEEP_ALIVE=0 se configura en Docker, no aquí
+# El contenedor descarga el modelo de GPU tras cada respuesta
