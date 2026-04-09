@@ -19,7 +19,7 @@ PARAMETER repeat_penalty 1.15
  
 # Máximo de tokens: 120 = ~3 oraciones cortas en español
 # Mantener bajo: reduce latencia y evita que el modelo se extienda
-PARAMETER num_predict 120
+PARAMETER num_predict 160
  
 # Threads de CPU para operaciones no-GPU del modelo
 PARAMETER num_thread 4
