@@ -23,7 +23,7 @@ tts:
     - CPUExecutionProvider
 
 audio:
-  device_index: 0
+  device_index: 24
   sample_rate_hw: 44100
   chunk_samples: 4410
   gain: 3.0
