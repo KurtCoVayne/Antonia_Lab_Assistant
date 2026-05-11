@@ -52,6 +52,12 @@ class AudioCapture:
     def get_chunk(self) -> npt.NDArray[np.float32]:
         return self._queue.get()
 
+    def get_chunk_timeout(self, timeout: float) -> npt.NDArray[np.float32] | None:
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
     def _callback(
         self,
         indata: npt.NDArray[np.float32],

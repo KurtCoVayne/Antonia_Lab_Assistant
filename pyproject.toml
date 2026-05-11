@@ -37,6 +37,7 @@ apple-silicon = [
     "torchaudio",
     "kokoro-onnx",
     "onnxruntime",
+    "silero-vad>=5.0",
 ]
 dev = [
     "ruff",

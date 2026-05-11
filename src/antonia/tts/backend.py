@@ -88,12 +88,39 @@ class TTSBackend:
 
         return SynthesisResult(samples=samples, sample_rate=sr, latency_s=latency, engine=engine)
 
+    def speak_sentence(
+        self,
+        text: str,
+        force_cpu: bool = False,
+    ) -> Optional[SynthesisResult]:
+        if not text.strip():
+            return None
+
+        t0 = time.time()
+        processed = self._pre.process(text)
+        if not processed:
+            return None
+
+        samples, sr, engine = self._synthesize(processed, force_cpu=force_cpu)
+        if samples is None:
+            log.error("tts_synthesis_failed")
+            return None
+
+        latency = time.time() - t0
+        try:
+            sd.play(samples, sr)
+            sd.wait()
+        except Exception as exc:
+            log.warning("tts_playback_error", error=str(exc))
+
+        return SynthesisResult(samples=samples, sample_rate=sr, latency_s=latency, engine=engine)
+
     def _synthesize(
-        self, text: str
+        self, text: str, force_cpu: bool = False
     ) -> tuple[Optional[npt.NDArray[np.float32]], int, str]:
         if self._kokoro is not None:
             try:
-                samples, sr = self._kokoro.synthesize(text)  # type: ignore[union-attr]
+                samples, sr = self._kokoro.synthesize(text, force_cpu=force_cpu)  # type: ignore[union-attr]
                 return samples, sr, "kokoro"
             except Exception as exc:
                 log.warning("kokoro_failed", error=str(exc))

@@ -15,8 +15,7 @@ from pathlib import Path
 import httpx
 import structlog
 
-N_TURNS        = 3
-RECORD_SECONDS = 7
+N_TURNS = 3
 
 
 async def _main() -> None:
@@ -49,10 +48,22 @@ async def _main() -> None:
         prompt = build_prompt_template(settings)
 
         from antonia.audio.capture import AudioCapture
+        from antonia.audio.listener import SmartListener
+        from antonia.audio.vad import SileroVAD
+
         capture = AudioCapture(
             sample_rate=settings.audio.sample_rate_hw,
             chunk_samples=settings.audio.chunk_samples,
             device=settings.audio.device_index,
+        )
+        vad = await asyncio.to_thread(SileroVAD)
+        listener = SmartListener(
+            capture=capture,
+            vad=vad,
+            sample_rate_hw=settings.audio.sample_rate_hw,
+            vad_threshold=settings.vad_threshold,
+            silence_windows=settings.silence_windows,
+            min_speech_windows=settings.min_speech_windows,
         )
 
         orchestrator = AntoniaOrchestrator(
@@ -67,30 +78,31 @@ async def _main() -> None:
 
         context = ConversationContext(max_messages=settings.history_max_messages)
 
-        for turn in range(1, N_TURNS + 1):
-            log.info("turn_start", turn=turn, total=N_TURNS)
-            log.info("recording_start", seconds=RECORD_SECONDS)
-            raw = await asyncio.to_thread(
-                capture.record_blocking, RECORD_SECONDS
-            )
-            import numpy as np
-            from datetime import datetime as dt
-            audio = RawAudio(
-                samples=raw.astype(np.float32),
-                sample_rate=settings.audio.sample_rate_hw,
-                captured_at=dt.now(),
-            )
-            record = await orchestrator.run_turn(audio, context, turn, save_wav=True)
-            log.info(
-                "turn_done",
-                user=record.user_text,
-                assistant=record.assistant_text,
-                lat_stt=round(record.lat_stt_s, 2),
-                lat_llm=round(record.lat_llm_s, 2),
-                lat_tts=round(record.lat_tts_s, 2),
-            )
-            if turn < N_TURNS:
-                await asyncio.sleep(3.0)
+        import numpy as np
+        from datetime import datetime as dt
+
+        capture.start()
+        try:
+            for turn in range(1, N_TURNS + 1):
+                log.info("turn_start", turn=turn, total=N_TURNS)
+                log.info("listening_for_speech")
+                raw = await asyncio.to_thread(listener.listen_until_silence)
+                audio = RawAudio(
+                    samples=raw.astype(np.float32),
+                    sample_rate=settings.audio.sample_rate_hw,
+                    captured_at=dt.now(),
+                )
+                record = await orchestrator.run_turn(audio, context, turn, save_wav=True)
+                log.info(
+                    "turn_done",
+                    user=record.user_text,
+                    assistant=record.assistant_text,
+                    lat_stt=round(record.lat_stt_s, 2),
+                    lat_llm=round(record.lat_llm_s, 2),
+                    lat_tts=round(record.lat_tts_s, 2),
+                )
+        finally:
+            capture.stop()
 
     log.info("session_complete", turns=N_TURNS)
 

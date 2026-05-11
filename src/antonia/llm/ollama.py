@@ -8,8 +8,10 @@ R-4: Exponential backoff with jitter on OOM errors.
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import time
+from collections.abc import AsyncGenerator
 
 import httpx
 import structlog
@@ -84,3 +86,42 @@ class OllamaBackend:
             elapsed = time.time() - t0
             log.error("ollama_unexpected", error=str(exc))
             return LLMResponse(text="", latency_s=elapsed)
+
+    async def ask_stream(
+        self,
+        messages: list[dict[str, str]],
+    ) -> AsyncGenerator[str, None]:
+        payload = {
+            "model":      self._cfg.model,
+            "keep_alive": self._cfg.keep_alive_seconds,
+            "stream":     True,
+            "options": {
+                "num_ctx":        self._cfg.num_ctx,
+                "temperature":    self._cfg.temperature,
+                "top_p":          0.8,
+                "repeat_penalty": 1.15,
+                "num_predict":    self._cfg.num_predict,
+            },
+            "messages": messages,
+        }
+        try:
+            async with self._client.stream("POST", self._url, json=payload) as resp:
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if "error" in data:
+                        log.error("ollama_stream_error", error=str(data["error"]))
+                        return
+                    content = data.get("message", {}).get("content", "")
+                    if content:
+                        yield content
+                    if data.get("done"):
+                        return
+        except httpx.TimeoutException:
+            log.error("ollama_stream_timeout")
+        except Exception as exc:
+            log.error("ollama_stream_unexpected", error=str(exc))

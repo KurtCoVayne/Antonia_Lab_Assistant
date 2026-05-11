@@ -17,3 +17,7 @@ class MockTTSBackend:
     ) -> Optional[SynthesisResult]:
         samples = np.zeros(16000, dtype=np.float32)
         return SynthesisResult(samples=samples, sample_rate=16000, latency_s=0.01, engine="mock")
+
+    def speak_sentence(self, text: str, force_cpu: bool = False) -> Optional[SynthesisResult]:
+        samples = np.zeros(16000, dtype=np.float32)
+        return SynthesisResult(samples=samples, sample_rate=16000, latency_s=0.01, engine="mock")

@@ -54,21 +54,33 @@ class KokoroBackend:
         if not voices_path.exists():
             raise FileNotFoundError(f"Kokoro voices not found: {voices_path}")
 
+        import onnxruntime as ort
         from kokoro_onnx import Kokoro
 
-        providers = onnx_providers or ["CPUExecutionProvider"]
-        try:
-            self._kokoro = Kokoro(str(model_path), str(voices_path), providers=providers)
-            log.info("kokoro_loaded", providers=providers)
-        except TypeError:
-            self._kokoro = Kokoro(str(model_path), str(voices_path))
-            log.warning("kokoro_no_providers_kwarg", fallback="CPU")
+        cpu_providers = ["CPUExecutionProvider"]
+        preferred_providers = onnx_providers or cpu_providers
+
+        cpu_session = ort.InferenceSession(str(model_path), providers=cpu_providers)
+        self._kokoro_cpu = Kokoro.from_session(cpu_session, str(voices_path))
+        log.info("kokoro_loaded", providers=cpu_providers)
+
+        if preferred_providers != cpu_providers:
+            try:
+                cuda_session = ort.InferenceSession(str(model_path), providers=preferred_providers)
+                self._kokoro_cuda = Kokoro.from_session(cuda_session, str(voices_path))
+                log.info("kokoro_cuda_loaded", providers=preferred_providers)
+            except Exception as exc:
+                log.warning("kokoro_cuda_fallback", error=str(exc))
+                self._kokoro_cuda = self._kokoro_cpu
+        else:
+            self._kokoro_cuda = self._kokoro_cpu
 
     def synthesize(
-        self, text: str, lang: str | None = None
+        self, text: str, lang: str | None = None, force_cpu: bool = False
     ) -> tuple[npt.NDArray[np.float32], int]:
         lang = lang or _detect_language(text)
         voice = VOICE_ES if lang == "es" else VOICE_EN
         lang_code = "es" if lang == "es" else "en-us"
-        samples, sr = self._kokoro.create(text, voice=voice, speed=1.0, lang=lang_code)
+        kokoro = self._kokoro_cpu if force_cpu else self._kokoro_cuda
+        samples, sr = kokoro.create(text, voice=voice, speed=1.0, lang=lang_code)
         return np.array(samples, dtype=np.float32), int(sr)

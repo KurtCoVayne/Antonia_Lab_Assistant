@@ -16,6 +16,8 @@ import structlog
 
 from antonia.domain.utterance import LLMResponse, RawAudio, SynthesisResult, TranscriptionResult
 from antonia.pipeline.context import ConversationContext, TurnRecord
+from antonia.pipeline.relay import GPURelay
+from antonia.tts.sentence_buffer import iter_sentences
 
 log = structlog.get_logger(__name__)
 
@@ -83,17 +85,31 @@ class AntoniaOrchestrator:
         # ── GPU Relay: Whisper out ─────────────────────────────────────────
         await self._relay.before_llm()  # type: ignore[union-attr]
 
-        # ── LLM ───────────────────────────────────────────────────────────
+        # ── LLM + TTS ─────────────────────────────────────────────────────
         messages = self._prompt.build_messages(  # type: ignore[union-attr]
             result.text, context, retrieval
         )
-        log.info("phase_llm_start")
-        llm_resp: LLMResponse = await self._llm.ask(messages)  # type: ignore[union-attr]
-        log.info(
-            "phase_llm_done",
-            latency_s=round(llm_resp.latency_s, 3),
-            tokens_per_sec=round(llm_resp.tokens_per_sec, 1),
-        )
+
+        if hasattr(self._llm, "ask_stream"):
+            llm_resp, tts_result = await self._run_streaming(messages)
+        else:
+            log.info("phase_llm_start")
+            llm_resp = await self._llm.ask(messages)  # type: ignore[union-attr]
+            log.info("phase_llm_done", latency_s=round(llm_resp.latency_s, 3))
+
+            tts_result = None
+            if not llm_resp.is_empty:
+                log.info("phase_tts_start")
+                wav_name = f"turn{turn_number:02d}.wav" if save_wav else "antonia_output.wav"
+                tts_result = await asyncio.to_thread(
+                    self._tts.speak,  # type: ignore[union-attr]
+                    llm_resp.text,
+                    True,
+                    save_wav,
+                    wav_name,
+                )
+                if tts_result:
+                    log.info("phase_tts_done", latency_s=round(tts_result.latency_s, 3))
 
         if not llm_resp.is_empty:
             context.add_turn(TurnRecord(
@@ -104,21 +120,6 @@ class AntoniaOrchestrator:
                 lat_llm_s=llm_resp.latency_s,
                 used_retrieval=retrieval is not None and not retrieval.is_empty,
             ))
-
-        # ── TTS ───────────────────────────────────────────────────────────
-        tts_result: Optional[SynthesisResult] = None
-        if not llm_resp.is_empty:
-            log.info("phase_tts_start")
-            wav_name = f"turn{turn_number:02d}.wav" if save_wav else "antonia_output.wav"
-            tts_result = await asyncio.to_thread(
-                self._tts.speak,  # type: ignore[union-attr]
-                llm_resp.text,
-                True,      # play_audio
-                save_wav,
-                wav_name,
-            )
-            if tts_result:
-                log.info("phase_tts_done", latency_s=round(tts_result.latency_s, 3))
 
         # ── GPU Relay: Whisper back ────────────────────────────────────────
         await self._relay.after_tts()  # type: ignore[union-attr]
@@ -136,3 +137,32 @@ class AntoniaOrchestrator:
             lat_tts_s=tts_result.latency_s if tts_result else 0.0,
             used_retrieval=retrieval is not None and not retrieval.is_empty,
         )
+
+    async def _run_streaming(
+        self,
+        messages: list[dict[str, str]],
+    ) -> tuple[LLMResponse, Optional[SynthesisResult]]:
+        force_cpu = isinstance(self._relay, GPURelay)
+        t0 = time.time()
+        parts: list[str] = []
+
+        log.info("phase_llm_tts_streaming_start")
+        async for sentence in iter_sentences(self._llm.ask_stream(messages)):  # type: ignore[union-attr]
+            parts.append(sentence)
+            log.debug("sentence_ready", preview=sentence[:40])
+            await asyncio.to_thread(
+                self._tts.speak_sentence,  # type: ignore[union-attr]
+                sentence,
+                force_cpu,
+            )
+
+        full_text = " ".join(parts)
+        elapsed = time.time() - t0
+        words = len(full_text.split())
+        llm_resp = LLMResponse(
+            text=full_text,
+            latency_s=elapsed,
+            tokens_per_sec=words / elapsed if elapsed > 0 else 0.0,
+        )
+        log.info("phase_llm_tts_streaming_done", latency_s=round(elapsed, 3))
+        return llm_resp, None
