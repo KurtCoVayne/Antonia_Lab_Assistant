@@ -1,0 +1,38 @@
+managed_by: ingest_pipeline
+terms:
+  \bAPI\b: A-pe-i
+  \bArduino\b: Arduíno
+  \bBluetooth\b: Blú-tuz
+  \bCPU\b: Ce-pe-u
+  \bEAFIT\b: E-a-fit
+  \bEthernet\b: Éternet
+  \bFPGA\b: Fe-pe-ge-a
+  \bGPU\b: Ge-pe-u
+  \bGitHub\b: Git-jab
+  \bHDMI\b: Hache-de-eme-i
+  \bHMI\b: Hache-eme-i
+  \bI2C\b: I-dos-ce
+  \bIoT\b: I-o-Te
+  \bJSON\b: Yéison
+  \bJetson\b: Yetson
+  \bLED\b: led
+  \bLEDs\b: leds
+  \bLabVIEW\b: Lab-viu
+  \bMATLAB\b: Matlab
+  \bNVIDIA\b: En-vidia
+  \bPLC\b: Pe-ele-ce
+  \bPLCs\b: Pe-ele-ces
+  \bPROFINET\b: Pro-fi-net
+  \bPWM\b: Pe-doble-uve-eme
+  \bPython\b: Páiton
+  \bRAM\b: ram
+  \bRaspberry Pi\b: Ráspberri Pai
+  \bS7-1200\b: ese-siete doce-cero-cero
+  \bSPI\b: ese-pe-i
+  \bSSD\b: ese-ese-de
+  \bSiemens\b: Síemens
+  \bTIA Portal\b: Tía Portal
+  \bUART\b: U-a-erre-te
+  \bUSB\b: U-ese-be
+  \bWi-Fi\b: Güái-fai
+version: '1.1'

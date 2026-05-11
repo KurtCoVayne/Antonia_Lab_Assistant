@@ -39,5 +39,5 @@ kb:
   relevance_threshold: 0.72
 
 logging:
-  level: DEBUG
+  level: INFO
   format: console

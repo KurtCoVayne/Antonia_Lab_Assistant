@@ -4,124 +4,186 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Antonia is a voice-controlled AI assistant for the Digital Control Laboratory at Universidad EAFIT (Medellín, Colombia). It runs on a **NVIDIA Jetson Orin Nano 8GB** with a USB microphone. The pipeline is: Wake Word → STT → LLM → TTS.
+Antonia is a voice-controlled AI assistant for the Digital Control Laboratory at Universidad EAFIT (Medellín, Colombia). It runs on a **NVIDIA Jetson Orin Nano 8GB** and is developed on **Apple Silicon M4**. Pipeline: Wake Word → STT → KB Retrieval → LLM → TTS.
 
-All code lives in `antonia_project/`. Models are stored externally on `/media/antonia_ssd/antonia/antonia_project/models/`.
+All library code lives in `src/antonia/`. Platform-specific constants live in `src/antonia/config/profiles/*.yaml`.
 
-## Running the Pipeline
+---
 
-```bash
-# Full STT→LLM→TTS pipeline test (runs N_TURNOS cycles with manual recording)
-cd antonia_project
-python llm/test_stt_llm_tts.py
-
-# Wake word + VAD + STT only (continuous loop, requires "Hey Jarvis")
-python modules/stt/antonia_core.py
-
-# Individual module tests
-python tests/whisper_test.py
-python tests/audio_test.py
-python llm/llm_test.py
-```
-
-## LLM — Ollama Docker
-
-Qwen 2.5 1.5B runs inside a Docker container (`ollama_antonia`):
+## Running the Project
 
 ```bash
-# Start container
-sudo docker start ollama_antonia
+# Create venv and install (first time)
+uv venv .venv --python 3.11
+uv pip install -e ".[dev]"
 
-# Pull model (if not present)
-sudo docker exec -it ollama_antonia ollama pull qwen2.5:1.5b
+# Run full pipeline (N_TURNS cycles with manual recording)
+ANTONIA_PROFILE=apple-silicon antonia-run
 
-# Create custom Modelfile (sets num_ctx=1024, temperature=0.1, num_predict=160)
-sudo docker exec -it ollama_antonia ollama create antonia-llm -f /path/to/config/Modelfile
+# Ingest knowledge base documents
+antonia-ingest
+
+# Benchmark STT latency
+antonia-bench
+
+# Tests
+make test          # unit tests (no hardware)
+make test-live     # integration tests (requires Ollama)
+
+# Lint + typecheck
+make lint
+make typecheck
+
+# Start infrastructure services (Ollama + ChromaDB)
+make dev-up        # Mac M4
+make jetson-up     # Jetson (adds --network host + NVIDIA runtime)
+make down
 ```
 
-The container is configured with `KEEP_ALIVE=0` so Qwen auto-unloads from GPU after each response. API endpoint: `http://localhost:11434/api/chat`.
+---
+
+## Platform Selection
+
+Set `ANTONIA_PROFILE` environment variable (or let it default to `apple-silicon`):
+
+| Profile | Hardware | STT | GPU Relay | TTS |
+|---|---|---|---|---|
+| `apple-silicon` | Mac M4 | Whisper CPU float32 | disabled | Kokoro CPU |
+| `jetson` | Jetson Orin Nano | Whisper CUDA float16 | **enabled** | Kokoro CUDA |
+| `cpu-only` | Any CPU | Whisper CPU int8 | disabled | Piper |
+
+No code changes are needed when switching platforms — only the env var changes.
+
+---
 
 ## Architecture
 
-### GPU Relay System (Critical Constraint)
+### Critical Constraint — GPU Relay (Jetson only)
 
-The Jetson has **unified memory** (~8 GB shared between CPU and GPU). Whisper and Qwen cannot coexist in VRAM. The relay cycle is:
+Jetson has **unified memory** (~8 GB shared CPU+GPU). Whisper and Qwen cannot coexist in VRAM. The relay is managed by `GPURelay` (`src/antonia/pipeline/relay.py`):
 
 ```
 STT: Whisper on GPU (~900 MB)
-  → stt.unload_gpu() + drop_os_cache()   ← clears VRAM for Qwen
+  → relay.before_llm()   # unload_gpu() + drop_os_cache() in parallel
 LLM: Qwen on GPU (~1600 MB)
   → KEEP_ALIVE=0 auto-unloads Qwen
-TTS: Kokoro on CPU (0 MB VRAM)
-  → stt.reload_gpu()                      ← Whisper returns
+TTS: Kokoro on CPU/GPU
+  → relay.after_tts()    # reload_gpu()
 ```
 
-`AntoniaSTT` (`modules/stt/stt_module.py`) exposes `unload_gpu()` and `reload_gpu()` for this handoff.
+On Mac M4 and `cpu-only`, `NullRelay` is used — both methods are no-ops.
 
-### STT Module (`modules/stt/`)
+### Directory Map
 
-- **`stt_module.py`** — `AntoniaSTT` class: Whisper small, float16, GPU. DSP pipeline: gain → librosa resample 44100→16000 Hz → pre-emphasis → peak normalization.
-- **`antonia_core.py`** — Standalone wake-word loop. State machine: `SLEEPING → FLUSHING → LISTENING → (PROCESSING in thread)`. Uses OpenWakeWord (`hey_jarvis`), Silero VAD, and Whisper. Discards 600ms of audio post-wake-word (WW_FLUSH_CHUNKS=6) so Whisper doesn't transcribe "Hey Jarvis".
+```
+src/antonia/
+├── config/
+│   ├── settings.py          # AntoniaSettings (pydantic-settings)
+│   └── profiles/            # jetson.yaml | apple_silicon.yaml | cpu_only.yaml
+├── domain/
+│   ├── utterance.py         # RawAudio, TranscriptionResult, LLMResponse, SynthesisResult
+│   └── prompt.py            # SystemPrompt, PromptTemplate, PromptRegistry
+├── audio/
+│   ├── dsp.py               # resample, preemphasis, peak_normalize (no model deps)
+│   ├── vad.py               # SileroVAD, VadBuffer (pre-allocated)
+│   └── capture.py           # AudioCapture (sounddevice abstraction)
+├── stt/
+│   ├── whisper.py           # WhisperBackend (faster-whisper, GPU lifecycle)
+│   └── mock.py
+├── llm/
+│   ├── ollama.py            # OllamaBackend (httpx async, exponential backoff)
+│   └── mock.py
+├── tts/
+│   ├── preprocessor.py      # TextPreprocessor (markdown strip, units, phonetics)
+│   ├── kokoro.py            # KokoroBackend (ONNX, CUDA fallback H-3)
+│   ├── piper.py             # PiperBackend (warm-pool subprocess R-3)
+│   ├── backend.py           # TTSBackend (facade)
+│   └── mock.py
+├── kb/
+│   ├── store.py             # ChromaStore (read-only), KBRetriever
+│   └── ingest/
+│       ├── pipeline.py      # Offline: docs → chunks → embed → Chroma
+│       └── phonetic.py      # Extracts technical terms → phonetic_map.yaml
+├── wakeword/
+│   ├── openwakeword.py      # OpenWakeWordBackend (hey_jarvis)
+│   └── mock.py
+├── pipeline/
+│   ├── orchestrator.py      # AntoniaOrchestrator (async state machine)
+│   ├── relay.py             # GPURelay / NullRelay
+│   └── context.py           # ConversationContext (typed history)
+├── infra/
+│   ├── logging.py           # structlog (console | json)
+│   ├── memory.py            # TorchMemoryManager / NullMemoryManager
+│   └── health.py            # check_ollama(), check_chroma()
+├── factory.py               # build_stt/llm/tts/relay() — selects concrete backend
+└── scripts/
+    ├── run_antonia.py       # antonia-run
+    ├── ingest_kb.py         # antonia-ingest
+    └── benchmark.py         # antonia-bench
+```
 
-Key tuning constants in `antonia_core.py`:
-- `NOISE_GATE_RMS = 0.008` — adjust for lab background noise (fans, equipment)
-- `VAD_THRESHOLD = 0.40`, `SILENCE_WINDOWS = 20` — controls utterance boundary detection
-- `LISTENING_TIMEOUT_CHUNKS = 60` — 6-second timeout before returning to sleep
+### Backend Protocol Pattern
 
-### TTS Module (`modules/tts/tts_module.py`)
+Every subsystem exposes a `typing.Protocol`. `AntoniaOrchestrator` depends only on protocols. `factory.py` instantiates the right concrete backend per `AntoniaSettings`. Tests inject `Mock*Backend` objects with zero hardware.
 
-Four-layer pipeline:
-1. **TextPreprocessor** — strips LLM markdown, expands units (kHz→kilohercios), applies phonetic substitutions
-2. **LanguageDetector** — ES/EN detection via `langdetect` or word-frequency heuristic
-3. **KokoroEngine** — primary: Kokoro-82M ONNX on CPU (`ef_dora` for ES, `af_bella` for EN)
-4. **PiperEngine** — fallback: Piper CLI subprocess
+### Prompt System
 
-Phonetic map lives in `knowledge_base/phonetic_map.json` (regex keys → phonetic strings). Load hot-reload via `tts.preprocessor.load_phonetic_map()` after updates — no restart needed. Keys starting with `_` are comments and are ignored.
+Prompts live in `config/prompts/*.yaml`. Selected by `settings.prompt_name` (default: `laboratory`). `PromptTemplate.build_messages()` is the only place that assembles the `messages` list sent to the LLM. Adding few-shot examples or changing wording requires only YAML edits, not Python changes.
 
-**RAG integration point**: When a RAG ingestion pipeline adds new technical terms to the lab knowledge base, it should also append entries to `phonetic_map.json` and call `load_phonetic_map()`. See `PUERTA_RAG` comment in `tts_module.py`.
+### Phonetic Map / TTS
 
-Global TTS instance: `from modules.tts.tts_module import tts`.
+`knowledge_base/phonetic_map.yaml` → regex-to-phonetic mappings. Compiled at `load_phonetic_map()` time, not per `speak()`. After `antonia-ingest` updates the YAML, call `preprocessor.load_phonetic_map()` for hot-reload.
 
-### LLM Client (`llm/test_stt_llm_tts.py`)
+---
 
-Uses `httpx.AsyncClient` with `keep_alive=0` in the payload to trigger Ollama's auto-unload. Maintains conversation history (max 4 messages = 2 turns). Retries on OOM errors with `drop_os_cache()`.
+## Configuration Reference
 
-### System Prompt / Persona
+### Key Profile Fields
 
-`config/system_prompt.txt` defines Antonia's persona: bilingual (understands ES/EN/Spanglish, always responds in Spanish), plain text only (no markdown — output goes directly to TTS), max 3–4 short sentences, zero hallucinations (RAG-only answers).
+| Field | Jetson | Mac M4 | Notes |
+|---|---|---|---|
+| `stt.compute_type` | `float16` | `float32` | `int8` for ~35-50% more throughput if stable |
+| `stt.device` | `cuda` | `cpu` | |
+| `llm.keep_alive_seconds` | `0` | `30` | 0 = strict relay; >0 = Qwen stays in VRAM during TTS |
+| `llm.num_ctx` | `1024` | `2048` | Jetson memory budget |
+| `tts.onnx_providers` | `[CUDA, CPU]` | `[CPU]` | |
+| `gpu_relay.enabled` | `true` | `false` | |
+| `kb.mode` | `server` | `embedded` | server = Docker ChromaDB |
 
-## Docker / Networking (H-4)
-
-To eliminate Docker NAT overhead (~1–2ms/request) on the Ollama container, recreate it with `--network host`:
+### Env Var Overrides
 
 ```bash
-sudo docker stop ollama_antonia && sudo docker rm ollama_antonia
-sudo docker run -d --name ollama_antonia --network host \
-  --gpus all -v ollama_data:/root/.ollama dustynv/ollama
+ANTONIA_PROFILE=jetson
+ANTONIA_BASE_DIR=/path/to/repo     # auto-detected by default
+ANTONIA_MODELS_DIR=/media/...      # models directory
 ```
 
-This collapses the path to a direct loopback connection (no iptables NAT). Acceptable for a single-purpose edge device.
+---
 
-## Sudoers for `drop_os_cache()` (C-3)
+## Docker / Infrastructure
 
-The pipeline calls `sudo sh -c "sync && echo 3 > /proc/sys/vm/drop_caches"`. Without NOPASSWD, this blocks indefinitely if the sudo session expires. Add to `/etc/sudoers` on the Jetson:
+```bash
+make dev-up       # Mac M4: starts Ollama + ChromaDB
+make jetson-up    # Jetson: adds host networking + NVIDIA runtime
+make down
+```
+
+### Jetson Docker (H-4)
+
+`docker/docker-compose.jetson.yml` uses `network_mode: host` to eliminate NAT overhead. Applied as an override: `docker compose -f docker-compose.yml -f docker-compose.jetson.yml up -d`.
+
+### Sudoers for `drop_os_cache()` (Jetson only, C-3)
 
 ```
 mecatronica ALL=(ALL) NOPASSWD: /bin/sh -c sync && echo 3 > /proc/sys/vm/drop_caches
 ```
 
-## Key Tuning Constants
-
-| Constant | File | Default | Notes |
-|---|---|---|---|
-| `COMPUTE_TYPE` | `stt_module.py` | `"float16"` | Switch to `"int8"` for ~35-50% more STT throughput if stable on JetPack 6 |
-| `OLLAMA_KEEP_ALIVE_S` | `test_stt_llm_tts.py` | `0` | Increase to ~10s to reduce Qwen cold-load latency (trade: Qwen stays in VRAM during TTS) |
-| `NOISE_GATE_RMS` | `antonia_core.py` | `0.008` | Increase if lab has high background noise |
-| `SILENCE_WINDOWS` | `antonia_core.py` | `20` | 20 × 32ms = ~640ms silence before end-of-utterance |
+---
 
 ## Hardware Notes
 
-- **Mic**: USB device index 0, native 44100 Hz — always resampled to 16000 Hz for Whisper/VAD
-- **Whisper compute type**: `float16` (more stable than `int8` on JetPack 6 Tegra)
-- **CTranslate2**: installed from local build (`/media/antonia_ssd/antonia/CTranslate2/python`)
-- After `unload_gpu()`, wait ~300–500ms for Tegra to consolidate physical memory blocks — `time.sleep(0.5)` is intentional
+- **Mic**: USB device index 0 on Jetson; `null` (system default) on Mac M4
+- **CTranslate2** on Jetson: built from source at `/media/antonia_ssd/antonia/CTranslate2/python`
+- **Whisper compute type**: `float16` is more stable than `int8` on JetPack 6 Tegra
+- **After `unload_gpu()`**: Tegra consolidates memory non-deterministically; `TorchMemoryManager` polls up to 1.0s (20 × 50ms)
+- **Models directory**: gitignored. Layout: `models/{whisper,kokoro,piper}/`

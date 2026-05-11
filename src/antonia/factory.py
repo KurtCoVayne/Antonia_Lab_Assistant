@@ -51,6 +51,9 @@ def build_tts(settings: AntoniaSettings) -> object:
     kokoro = None
     piper = None
 
+    kokoro_exc: Exception | None = None
+    piper_exc: Exception | None = None
+
     if settings.tts.backend in ("kokoro-cuda", "kokoro-cpu"):
         try:
             from antonia.tts.kokoro import KokoroBackend
@@ -60,6 +63,7 @@ def build_tts(settings: AntoniaSettings) -> object:
                 onnx_providers=settings.tts.onnx_providers,
             )
         except (FileNotFoundError, ImportError) as exc:
+            kokoro_exc = exc
             log.warning("kokoro_unavailable", error=str(exc))
 
     try:
@@ -69,7 +73,18 @@ def build_tts(settings: AntoniaSettings) -> object:
             en_model=settings.piper_en_model,
         )
     except (FileNotFoundError, ImportError) as exc:
+        piper_exc = exc
         log.warning("piper_unavailable", error=str(exc))
+
+    if kokoro is None and piper is None:
+        causes = []
+        if kokoro_exc:
+            causes.append(f"kokoro: {kokoro_exc}")
+        if piper_exc:
+            causes.append(f"piper: {piper_exc}")
+        raise RuntimeError(
+            "No TTS engine could be loaded. " + " | ".join(causes)
+        )
 
     return TTSBackend(
         preprocessor=pre,
