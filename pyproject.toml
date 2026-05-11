@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "antonia"
 version = "0.3.0"
 description = "Voice-controlled AI assistant for the Digital Control Laboratory at EAFIT"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 readme = "README.md"
 
 dependencies = [
