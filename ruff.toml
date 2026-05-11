@@ -1,0 +1,18 @@
+target-version = "py311"
+line-length    = 100
+
+[lint]
+select = ["E", "F", "I", "N", "UP", "ANN", "ASYNC", "B", "SIM", "TCH", "T201", "RUF003"]
+ignore = [
+    "ANN101",   # self annotation adds no value
+    "ANN102",   # cls annotation adds no value
+    "ANN401",   # Any is sometimes needed for numpy interop
+]
+
+[lint.per-file-ignores]
+"scripts/*"       = ["N", "ANN"]
+"tests/*"         = ["ANN", "S101"]
+"src/antonia/scripts/*" = ["N", "ANN"]
+
+[lint.isort]
+known-first-party = ["antonia"]

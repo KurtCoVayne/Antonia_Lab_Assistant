@@ -1,0 +1,43 @@
+stt:
+  backend: whisper-cpu
+  compute_type: float32
+  device: cpu
+  device_index: 0
+  num_workers: 2
+  cpu_threads: 8
+  model_size: small
+
+llm:
+  backend: ollama
+  base_url: http://localhost:11434
+  model: qwen2.5:1.5b
+  keep_alive_seconds: 30
+  num_ctx: 2048
+  temperature: 0.1
+  num_predict: 200
+
+tts:
+  backend: kokoro-cpu
+  onnx_providers:
+    - CPUExecutionProvider
+
+audio:
+  device_index: null
+  sample_rate_hw: 44100
+  chunk_samples: 4410
+  gain: 3.0
+
+gpu_relay:
+  enabled: false
+
+kb:
+  mode: embedded
+  persist_directory: knowledge_base/chroma
+  embedding_model: nomic-embed-text
+  chunk_size: 512
+  chunk_overlap: 64
+  relevance_threshold: 0.72
+
+logging:
+  level: DEBUG
+  format: console

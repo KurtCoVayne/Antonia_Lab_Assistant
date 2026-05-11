@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "antonia"
+version = "0.3.0"
+description = "Voice-controlled AI assistant for the Digital Control Laboratory at EAFIT"
+requires-python = ">=3.11"
+readme = "README.md"
+
+dependencies = [
+    "httpx>=0.28",
+    "sounddevice>=0.5",
+    "soundfile>=0.13",
+    "numpy>=1.26",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "chromadb>=0.5",
+    "faster-whisper>=1.2",
+    "structlog>=24.0",
+    "pyyaml>=6.0",
+    "langdetect>=1.0",
+]
+
+[project.optional-dependencies]
+jetson = [
+    "torch",
+    "torchaudio",
+    "kokoro-onnx",
+    "onnxruntime-gpu",
+    "openwakeword>=0.6",
+    "silero-vad>=5.0",
+]
+apple-silicon = [
+    "torch",
+    "torchaudio",
+    "kokoro-onnx",
+    "onnxruntime",
+]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov",
+    "scipy",
+]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "hypothesis",
+]
+
+[project.scripts]
+antonia-run     = "antonia.scripts.run_antonia:main"
+antonia-ingest  = "antonia.scripts.ingest_kb:main"
+antonia-bench   = "antonia.scripts.benchmark:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/antonia"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths    = ["tests"]
+
+[tool.mypy]
+python_version         = "3.11"
+strict                 = true
+ignore_missing_imports = false
+[[tool.mypy.overrides]]
+module = ["kokoro_onnx.*", "openwakeword.*", "silero_vad.*", "langdetect.*", "sounddevice.*"]
+ignore_missing_imports = true

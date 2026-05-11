@@ -1,17 +1,31 @@
-venv_antonia/
-models/
-logs/
 __pycache__/
-*.pyc
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.uv/
+uv.lock
 
-# Archivos de sistema
-.DS_Store
-Thumbs.db
+# Models
+models/
 
-# Archivos de audio
-*.wav
-*.mp3
-*.flac
+# Chroma vector store
+knowledge_base/chroma/
 
-# Archivos de configuración sensible
+# Generated WAV files
+tests/pipeline_runs/
+
+# Environment
 .env
+.env.*
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

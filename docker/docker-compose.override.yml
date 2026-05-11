@@ -1,0 +1,9 @@
+version: "3.9"
+
+services:
+  ollama:
+    environment:
+      - OLLAMA_DEBUG=1
+  chroma:
+    environment:
+      - CHROMA_LOG_CONFIG=debug

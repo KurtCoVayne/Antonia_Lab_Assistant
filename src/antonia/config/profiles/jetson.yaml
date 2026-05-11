@@ -1,0 +1,49 @@
+stt:
+  backend: whisper-cuda
+  compute_type: float16
+  device: cuda
+  device_index: 0
+  num_workers: 2
+  cpu_threads: 4
+  model_size: small
+
+llm:
+  backend: ollama
+  base_url: http://localhost:11434
+  model: qwen2.5:1.5b
+  keep_alive_seconds: 0
+  num_ctx: 1024
+  temperature: 0.1
+  num_predict: 120
+
+tts:
+  backend: kokoro-cuda
+  onnx_providers:
+    - CUDAExecutionProvider
+    - CPUExecutionProvider
+
+audio:
+  device_index: 0
+  sample_rate_hw: 44100
+  chunk_samples: 4410
+  gain: 3.0
+
+gpu_relay:
+  enabled: true
+  unload_target_mb: 50
+  poll_interval_seconds: 0.05
+  max_polls: 20
+
+kb:
+  mode: server
+  host: localhost
+  port: 8000
+  persist_directory: knowledge_base/chroma
+  embedding_model: nomic-embed-text
+  chunk_size: 512
+  chunk_overlap: 64
+  relevance_threshold: 0.72
+
+logging:
+  level: INFO
+  format: json
