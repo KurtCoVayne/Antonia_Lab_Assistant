@@ -72,7 +72,8 @@ class TTSBackend:
 
         if play_audio:
             try:
-                sd.play(samples, sr)
+                play_samples, play_sr = self._resample_for_device(samples, sr)
+                sd.play(play_samples, play_sr)
                 sd.wait()
             except Exception as exc:
                 log.warning("tts_playback_error", error=str(exc))
@@ -108,12 +109,29 @@ class TTSBackend:
 
         latency = time.time() - t0
         try:
-            sd.play(samples, sr)
+            play_samples, play_sr = self._resample_for_device(samples, sr)
+            sd.play(play_samples, play_sr)
             sd.wait()
         except Exception as exc:
             log.warning("tts_playback_error", error=str(exc))
 
         return SynthesisResult(samples=samples, sample_rate=sr, latency_s=latency, engine=engine)
+
+    @staticmethod
+    def _resample_for_device(
+        samples: npt.NDArray[np.float32], sr: int
+    ) -> tuple[npt.NDArray[np.float32], int]:
+        try:
+            device_sr = int(sd.query_devices(kind="output")["default_samplerate"])
+        except Exception:
+            return samples, sr
+        if sr == device_sr:
+            return samples, sr
+        # Integer-ratio resample via numpy linear interpolation (no scipy needed)
+        n_out = int(len(samples) * device_sr / sr)
+        x_old = np.linspace(0, 1, len(samples))
+        x_new = np.linspace(0, 1, n_out)
+        return np.interp(x_new, x_old, samples).astype(np.float32), device_sr
 
     def _synthesize(
         self, text: str, force_cpu: bool = False
