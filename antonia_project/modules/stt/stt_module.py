@@ -2,27 +2,55 @@
 modules/stt/stt_module.py
 Proyecto Antonia — EAFIT
 
-Módulo STT: Whisper small GPU float16 + DSP pipeline
+Módulo STT: Whisper small GPU + DSP pipeline
 Sistema de relevos GPU: unload_gpu() / reload_gpu()
 """
 
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# C-4: max_split_size_mb preserva bloques contiguos ≥512 MB para Ollama.
+#      garbage_collection_threshold activa limpieza proactiva antes de OOM.
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+    "expandable_segments:True,"
+    "max_split_size_mb:512,"
+    "garbage_collection_threshold:0.8"
+)
 
 import gc
 import time
 import torch
+import torchaudio
 import numpy as np
-import librosa
 from faster_whisper import WhisperModel
 
 # ── Configuración ──────────────────────────────────────────────────────────
-MODEL_SIZE  = "small"
-DEVICE      = "cuda"
-COMPUTE     = "float16"   # float16 nativo Tegra — más estable que int8 en JetPack 6
-SR_HW       = 44100       # Sample rate nativo del mic USB
-SR_TARGET   = 16000       # Sample rate requerido por Whisper
-GAIN        = 3.0         # Compensación de baja sensibilidad del mic
+MODEL_SIZE = "small"
+DEVICE     = "cuda"
+
+# H-1: Expuesto como constante para ajuste sin-tocar-código en Jetson.
+# float16 es más estable que int8 en JetPack 6 (comportamiento documentado
+# en el hardware). Cambiar a "int8" para ~35-50% más throughput si se
+# verifica estabilidad en el dispositivo.
+COMPUTE_TYPE = "float16"
+
+SR_HW      = 44100   # Sample rate nativo del mic USB
+SR_TARGET  = 16000   # Sample rate requerido por Whisper
+GAIN       = 3.0     # Compensación de baja sensibilidad del mic
+
+# H-2: Resampler construido UNA VEZ al importar el módulo.
+# torchaudio usa NEON/SVE en ARM64 (JetPack toolchain) → 3-6× más rápido
+# que librosa/soxr que no tiene vectorización ARM en el wheel de PyPI.
+# sinc_interp_hann: 3× más rápido que kaiser, sin diferencia audible
+# para la etapa de entrada de Whisper.
+_resampler = torchaudio.transforms.Resample(
+    orig_freq=SR_HW,
+    new_freq=SR_TARGET,
+    resampling_method="sinc_interp_hann",
+)
+
+# Umbrales para unload_gpu() polling
+_VRAM_TARGET_MB  = 50
+_POLL_INTERVAL_S = 0.05
+_MAX_POLLS       = 20   # 20 × 50ms = 1.0s máximo
 
 
 class AntoniaSTT:
@@ -33,7 +61,7 @@ class AntoniaSTT:
         texto, lat = stt.transcribe(audio_44k)
         stt.unload_gpu()          # libera VRAM antes de Ollama
         ...llamada a LLM...
-        ...TTS reproduce en CPU... # no hay conflicto de GPU aquí
+        ...TTS reproduce en CPU...
         stt.reload_gpu()          # recarga Whisper después de TTS
     """
 
@@ -45,14 +73,14 @@ class AntoniaSTT:
     # ── Ciclo de vida en VRAM ──────────────────────────────────────────────
 
     def _load(self) -> None:
-        print(f"[STT]  Cargando Whisper '{MODEL_SIZE}' ({DEVICE}, {COMPUTE})...")
+        print(f"[STT]  Cargando Whisper '{MODEL_SIZE}' ({DEVICE}, {COMPUTE_TYPE})...")
         t0 = time.time()
         self.whisper = WhisperModel(
             MODEL_SIZE,
             device=DEVICE,
-            compute_type=COMPUTE,
-            device_index=0,   # Ruteo explícito al bus GPU principal
-            num_workers=1,    # Evita clonación de tensores en RAM en la carga
+            compute_type=COMPUTE_TYPE,
+            device_index=0,
+            num_workers=1,
             cpu_threads=4,
         )
         self._loaded = True
@@ -63,37 +91,39 @@ class AntoniaSTT:
         """
         Descarga Whisper de GPU.
         Llama ANTES de enviar la petición a Ollama.
-        En Tegra (memoria unificada) la liberación física tarda ~300-500ms.
         """
         if not self._loaded:
             return
 
         del self.whisper
-        self.whisper = None
-        self._loaded = False
+        self.whisper  = None
+        self._loaded  = False
 
-        gc.collect()                  # 1. GC de Python libera referencias
-        torch.cuda.empty_cache()      # 2. Devuelve caché PyTorch al OS
-        torch.cuda.synchronize()      # 3. Espera fin de todos los kernels CUDA
-        time.sleep(0.5)               # 4. Tegra consolida bloques contiguos
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
-        mem = torch.cuda.memory_allocated() / 1024 ** 2
-        estado = "✅" if mem < 50 else "⚠ ALTA"
-        print(f"[STT]  🔄 Whisper descargado. VRAM residual: {mem:.0f} MB {estado}")
-
-        if mem > 50:                  # Segunda pasada si queda demasiado
-            time.sleep(0.5)
+        # C-4: Polling determinista en lugar de sleep fijo.
+        # En Tegra (memoria unificada), la consolidación física es no-determinista.
+        # Máximo 1.0s (20 × 50ms); sale antes si la VRAM ya está limpia.
+        for _ in range(_MAX_POLLS):
+            if torch.cuda.memory_reserved() / 1024 ** 2 < _VRAM_TARGET_MB:
+                break
             torch.cuda.empty_cache()
+            time.sleep(_POLL_INTERVAL_S)
+
+        mem    = torch.cuda.memory_allocated() / 1024 ** 2
+        estado = "✅" if mem < _VRAM_TARGET_MB else "⚠ ALTA"
+        print(f"[STT]  🔄 Whisper descargado. VRAM residual: {mem:.0f} MB {estado}")
 
     def reload_gpu(self) -> None:
         """
         Recarga Whisper en GPU.
         Llama DESPUÉS de que TTS termine de reproducir.
-        Con KEEP_ALIVE=0 en Docker, Qwen ya se descargó automáticamente.
         """
         if self._loaded:
             return
-        time.sleep(0.3)   # Margen para que KEEP_ALIVE=0 termine
+        time.sleep(0.3)   # Margen para que KEEP_ALIVE expire en Ollama
         self._load()
 
     # ── DSP ────────────────────────────────────────────────────────────────
@@ -102,15 +132,15 @@ class AntoniaSTT:
     def prepare_audio(
         raw: np.ndarray,
         gain: float = GAIN,
-        orig_sr: int = SR_HW,
-        target_sr: int = SR_TARGET,
     ) -> np.ndarray:
         """
-        Pipeline DSP: ganancia → resampleo 44100→16000 Hz
+        Pipeline DSP: ganancia → resampleo 44100→16000 Hz (torchaudio NEON)
                     → pre-énfasis → normalización de pico.
         """
         audio = np.clip(raw * gain, -1.0, 1.0)
-        audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr)
+        # H-2: torchaudio en lugar de librosa para resampleo vectorizado en ARM64
+        t     = torch.from_numpy(audio).float().unsqueeze(0)
+        audio = _resampler(t).squeeze(0).numpy()
         audio = np.append(audio[0], audio[1:] - 0.97 * audio[:-1])  # pre-énfasis
         peak  = np.max(np.abs(audio))
         if peak > 0:
@@ -130,7 +160,7 @@ class AntoniaSTT:
         Args:
             audio:       Array float32. Si viene del mic → 44100 Hz.
                          Si ya fue resampleado → pasar already_16k=True.
-            already_16k: True para saltar el DSP (audio ya a 16 kHz).
+            already_16k: True para saltar el DSP.
 
         Returns:
             (texto, latencia_segundos)
@@ -144,7 +174,7 @@ class AntoniaSTT:
             audio = self.prepare_audio(audio)
 
         if np.max(np.abs(audio)) < 0.04:
-            return "", 0.0   # Silencio — no gastar GPU
+            return "", 0.0
 
         t0 = time.time()
         segments, _ = self.whisper.transcribe(

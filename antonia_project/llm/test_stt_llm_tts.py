@@ -3,27 +3,31 @@ tests/test_stt_llm_tts.py
 Proyecto Antonia — EAFIT
 
 Pipeline completo de prueba: STT → LLM → TTS
-Whisper small GPU float16 | Qwen 2.5 1.5B Docker | Kokoro-82M CPU
+Whisper small GPU | Qwen 2.5 1.5B Docker | Kokoro-82M CPU/GPU
 
 Ciclo de memoria GPU (sistema de relevos):
   [IDLE]
-    ↓ wake implícito (grabación manual en esta prueba)
   [STT]   Whisper en GPU  (~900 MB VRAM)
-    ↓ unload_gpu() + drop_os_cache()
-  [LLM]   Qwen en GPU     (~1600 MB VRAM) — heap CUDA limpio
-    ↓ KEEP_ALIVE=0 → Qwen se descarga automáticamente
-  [TTS]   Kokoro en CPU   (0 MB VRAM) — sin conflicto
+    ↓ unload_gpu() + drop_os_cache() en paralelo (asyncio.gather)
+  [LLM]   Qwen en GPU     (~1600 MB VRAM)
+    ↓ KEEP_ALIVE expira → Qwen se descarga automáticamente
+  [TTS]   Kokoro en CPU/GPU (sin conflicto)
     ↓ reload_gpu()
   [IDLE]
 
-Los WAVs de cada turno se guardan en tests/
+Los WAVs de cada turno se guardan en tests/pipeline_runs/
 para verificación auditiva vía SSH.
 """
 
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+    "expandable_segments:True,"
+    "max_split_size_mb:512,"
+    "garbage_collection_threshold:0.8"
+)
 
 import sys
+import random
 import subprocess
 import asyncio
 import time
@@ -48,7 +52,13 @@ MIC_DEVICE     = 0
 SR_HW          = 44100
 RECORD_SECONDS = 7
 MAX_RETRIES    = 2
-N_TURNOS       = 3        # Número de ciclos a probar en el loop
+N_TURNOS       = 3
+
+# C-2: keep_alive=0 evicta Qwen tras cada respuesta (relay estricto).
+# Aumentar a ~10 si se acepta que Qwen permanezca en VRAM durante TTS.
+# Con 0, el cold-load de Qwen desde el overlay filesystem del contenedor
+# domina la latencia por turno (8-12s en NVMe frío).
+OLLAMA_KEEP_ALIVE_S = 0
 
 SYSTEM_PROMPT = (
     "Eres Antonia, asistente del Laboratorio de Control Digital de EAFIT. "
@@ -57,7 +67,6 @@ SYSTEM_PROMPT = (
     "Si no tienes información, di: No tengo esa información, consulta al monitor."
 )
 
-# Directorio donde se guardan los WAVs de cada turno
 WAV_DIR = PROJECT_ROOT / "tests" / "pipeline_runs"
 WAV_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -66,24 +75,40 @@ WAV_DIR.mkdir(parents=True, exist_ok=True)
 # UTILIDADES
 # ══════════════════════════════════════════════════════════════
 
-def drop_os_cache() -> None:
+async def drop_os_cache() -> None:
     """
-    Pide al kernel liberar la caché de páginas.
-    Ayuda al allocator Tegra a consolidar bloques físicos contiguos
-    antes de que Ollama intente reservar memoria para Qwen.
+    C-3: Pide al kernel liberar la caché de páginas.
+    - Completamente asíncrono (asyncio.to_thread + asyncio.wait_for).
+    - Timeout duro de 5s sobre el hilo; timeout de 4s sobre el subprocess.
+    - Falla silenciosa en todos los casos: el pipeline continúa.
+    - Requiere NOPASSWD en sudoers para el comando específico:
+        mecatronica ALL=(ALL) NOPASSWD: /bin/sh -c sync && echo 3 > /proc/sys/vm/drop_caches
     """
+    def _sync_call() -> None:
+        try:
+            subprocess.run(
+                ["sudo", "sh", "-c", "sync && echo 3 > /proc/sys/vm/drop_caches"],
+                check=True,
+                capture_output=True,
+                timeout=4,
+            )
+            print("[MEM]  Caché del SO liberada ✅")
+        except subprocess.TimeoutExpired:
+            print("[MEM]  drop_os_cache: subprocess timeout (4s) — continúa")
+        except subprocess.CalledProcessError as e:
+            print(f"[MEM]  drop_os_cache: error de proceso ({e.returncode}) — continúa")
+        except PermissionError:
+            print("[MEM]  drop_os_cache: permiso denegado — configura sudoers NOPASSWD")
+        except OSError as e:
+            print(f"[MEM]  drop_os_cache: OSError ({e}) — continúa")
+
     try:
-        subprocess.run(
-            ["sudo", "sh", "-c", "sync && echo 3 > /proc/sys/vm/drop_caches"],
-            check=True, capture_output=True, timeout=3
-        )
-        print("[MEM]  Caché del SO liberada ✅")
-    except Exception:
-        print("[MEM]  No se pudo liberar caché del SO (continúa sin esto)")
+        await asyncio.wait_for(asyncio.to_thread(_sync_call), timeout=5.0)
+    except asyncio.TimeoutError:
+        print("[MEM]  drop_os_cache: timeout del event loop (5s) — continúa")
 
 
-def record_audio(seconds: int, sr: int, device: int) -> np.ndarray:
-    """Graba audio mono float32 desde el micrófono USB."""
+def _record_audio_sync(seconds: int, sr: int, device: int) -> np.ndarray:
     print(f"\n  🎤 Grabando {seconds}s... ¡Habla ahora!")
     audio = sd.rec(
         int(seconds * sr),
@@ -97,7 +122,6 @@ def record_audio(seconds: int, sr: int, device: int) -> np.ndarray:
 
 
 def wav_path(turno: int, fase: str) -> str:
-    """Genera nombre de archivo WAV con timestamp para identificación."""
     ts = datetime.now().strftime("%H%M%S")
     return str(WAV_DIR / f"turno{turno:02d}_{fase}_{ts}.wav")
 
@@ -116,18 +140,22 @@ async def ask_llm(
     Envía la pregunta a Qwen 2.5 1.5B via Docker Ollama.
     Incluye historial de conversación (máximo 2 turnos anteriores).
 
+    R-4: Backoff exponencial con jitter en reintentos por OOM.
+         Verifica VRAM antes de reintentar.
+
     Returns:
         (respuesta, latencia_s, tok_s)
     """
-    # Construir mensajes con historial (máximo 4 mensajes = 2 turnos)
+    import torch
+
     mensajes = [{"role": "system", "content": SYSTEM_PROMPT}]
     mensajes += historial[-4:]
     mensajes.append({"role": "user", "content": texto})
 
     payload = {
-        "model":  MODEL,
-        "keep_alive": 0,
-        "stream": False,
+        "model":      MODEL,
+        "keep_alive": OLLAMA_KEEP_ALIVE_S,
+        "stream":     False,
         "options": {
             "num_ctx":        1024,
             "temperature":    0.1,
@@ -148,9 +176,16 @@ async def ask_llm(
             err = data["error"]
             print(f"\n  ❌ OLLAMA ERROR: {err}")
             if "out of memory" in err and retry < MAX_RETRIES:
-                print(f"  ⏳ OOM residual — reintentando en 2s ({retry+1}/{MAX_RETRIES})")
-                await asyncio.sleep(2.0)
-                drop_os_cache()
+                # R-4: backoff exponencial con jitter (1-2s, 3-5s, …)
+                delay = (2 ** retry) + random.uniform(0.0, 1.0)
+                print(f"  ⏳ OOM — reintentando en {delay:.1f}s ({retry+1}/{MAX_RETRIES})")
+                await asyncio.sleep(delay)
+
+                # R-4: verificar VRAM antes de reintentar — no tiene sentido
+                # hacer la petición HTTP si el allocator de Tegra no consolidó
+                mem_mb = torch.cuda.memory_reserved() / 1024 ** 2
+                print(f"[MEM]  VRAM reservada pre-retry: {mem_mb:.0f} MB")
+                await drop_os_cache()
                 return await ask_llm(texto, client, historial, retry + 1)
             return "", elapsed, 0.0
 
@@ -182,18 +217,21 @@ async def run_turn(
     """
     Ejecuta un ciclo completo del pipeline con sistema de relevos GPU.
 
+    C-1: Todas las llamadas bloqueantes se delegan a asyncio.to_thread()
+    para no congelar el event loop de asyncio durante operaciones GPU,
+    I/O de audio, o subprocesos. unload_gpu() y drop_os_cache() se
+    ejecutan en paralelo via asyncio.gather() porque son independientes
+    (allocator PyTorch vs. caché de páginas del kernel).
+
     Orden de memoria GPU:
       1. STT:  Whisper en GPU
-      2. unload_gpu() + drop_os_cache()
-      3. LLM:  Qwen en GPU (heap limpio)
-      4. KEEP_ALIVE=0 → Qwen se descarga automáticamente al terminar
-      5. TTS:  Kokoro en CPU (sin conflicto GPU)
-      6. reload_gpu() → Whisper vuelve para el siguiente turno
-
-    Returns:
-        dict con texto, respuesta, tts_path y métricas de latencia
+      2. unload_gpu() ‖ drop_os_cache()  ← en paralelo
+      3. LLM:  Qwen en GPU
+      4. KEEP_ALIVE expira → Qwen descargado automáticamente
+      5. TTS:  Kokoro en CPU/GPU
+      6. reload_gpu()
     """
-    t_ciclo = time.time()
+    t_ciclo   = time.time()
     resultado = {
         "turno":     turno,
         "texto":     "",
@@ -207,12 +245,12 @@ async def run_turn(
         "ok":        False,
     }
 
-    # ── FASE 1: Captura de audio ────────────────────────────────────────
-    raw = record_audio(RECORD_SECONDS, SR_HW, MIC_DEVICE)
+    # ── FASE 1: Captura de audio (bloqueante → hilo) ────────────────────
+    raw = await asyncio.to_thread(_record_audio_sync, RECORD_SECONDS, SR_HW, MIC_DEVICE)
 
-    # ── FASE 2: STT — Whisper en GPU ────────────────────────────────────
+    # ── FASE 2: STT — Whisper en GPU (bloqueante → hilo) ────────────────
     print(f"\n  [STT] Transcribiendo...")
-    texto, lat_stt = stt.transcribe(raw)
+    texto, lat_stt = await asyncio.to_thread(stt.transcribe, raw)
     resultado["texto"]   = texto
     resultado["lat_stt"] = lat_stt
     print(f"  [STT] ({lat_stt:.2f}s): \"{texto}\"")
@@ -222,10 +260,12 @@ async def run_turn(
         resultado["lat_total"] = time.time() - t_ciclo
         return resultado
 
-    # ── FASE 3: RELEVO — Whisper sale de GPU ────────────────────────────
+    # ── FASE 3: RELEVO — Whisper sale, OS cache se libera (en paralelo) ─
     print("\n  [RELEVO] Descargando Whisper de GPU...")
-    stt.unload_gpu()
-    drop_os_cache()
+    await asyncio.gather(
+        asyncio.to_thread(stt.unload_gpu),
+        drop_os_cache(),
+    )
 
     # ── FASE 4: LLM — Qwen entra en GPU ─────────────────────────────────
     print(f"  [LLM] Consultando {MODEL}...")
@@ -237,33 +277,32 @@ async def run_turn(
     if respuesta:
         print(f"  [LLM] ({lat_llm:.2f}s, {tok_s:.1f} tok/s):")
         print(f"        \"{respuesta}\"")
-        # Acumular historial para siguiente turno
         historial.append({"role": "user",      "content": texto})
         historial.append({"role": "assistant", "content": respuesta})
     else:
         print(f"  ⚠  LLM sin respuesta ({lat_llm:.2f}s)")
 
-    # ── FASE 5: TTS — Kokoro en CPU (Qwen ya se descargó por KEEP_ALIVE=0)
+    # ── FASE 5: TTS — Kokoro en CPU/GPU (Qwen se descargó por KEEP_ALIVE)
     if respuesta and antonia_tts is not None:
         print("\n  [TTS] Sintetizando respuesta...")
-        t_tts = time.time()
-        wav   = wav_path(turno, "respuesta")
+        t_tts    = time.time()
+        wav_name = f"turno{turno:02d}_respuesta.wav"
 
-        # save_wav=True siempre en pruebas — para verificar por SSH
-        antonia_tts.speak(
+        await asyncio.to_thread(
+            antonia_tts.speak,
             respuesta,
-            save_wav=True,
-            wav_filename=f"turno{turno:02d}_respuesta.wav",
-            play_audio=True,
+            True,       # save_wav
+            wav_name,
+            True,       # play_audio
         )
         resultado["lat_tts"]  = time.time() - t_tts
-        resultado["tts_path"] = str(WAV_DIR / f"turno{turno:02d}_respuesta.wav")
+        resultado["tts_path"] = str(WAV_DIR / wav_name)
     elif antonia_tts is None:
         print("  ⚠  TTS no inicializado — respuesta solo en texto.")
 
-    # ── FASE 6: RELEVO — Whisper vuelve a GPU ───────────────────────────
+    # ── FASE 6: RELEVO — Whisper vuelve a GPU (bloqueante → hilo) ───────
     print("\n  [RELEVO] Recargando Whisper en GPU...")
-    stt.reload_gpu()
+    await asyncio.to_thread(stt.reload_gpu)
 
     resultado["lat_total"] = time.time() - t_ciclo
     resultado["ok"]        = bool(respuesta)
@@ -280,19 +319,18 @@ async def main():
     print("═" * 60)
     print("  PIPELINE ANTONIA — STT + LLM + TTS")
     print(f"  {ts_inicio}")
-    print("  Whisper small GPU float16")
+    print("  Whisper small GPU")
     print("  Qwen 2.5 1.5B Docker (dustynv/ollama)")
-    print("  Kokoro-82M CPU")
+    print(f"  keep_alive={OLLAMA_KEEP_ALIVE_S}s")
+    print("  Kokoro-82M")
     print("═" * 60)
 
-    # ── Inicializar módulos ───────────────────────────────────────────────
     print("\n[INIT] Cargando STT...")
-    stt = AntoniaSTT()
+    stt = await asyncio.to_thread(AntoniaSTT)
 
     if antonia_tts is None:
         print("[WARN] TTS no disponible — el pipeline continuará sin voz.")
 
-    # ── Verificar Ollama Docker ───────────────────────────────────────────
     historial: list[dict] = []
     metricas:  list[dict] = []
 
@@ -311,7 +349,6 @@ async def main():
             print("        Ejecuta: sudo docker start ollama_antonia")
             return
 
-        # ── Loop de turnos ────────────────────────────────────────────────
         for turno in range(1, N_TURNOS + 1):
             print(f"\n{'─'*60}")
             print(f"  TURNO {turno}/{N_TURNOS}")

@@ -5,8 +5,8 @@ Proyecto Antonia — EAFIT
 Pipeline TTS:
   TextPreprocessor  → limpia LLM output + fonética desde phonetic_map.json
   LanguageDetector  → detecta ES/EN
-  KokoroEngine      → motor primario CPU (ef_dora ES, af_bella EN)
-  PiperEngine       → fallback CPU (dos modelos ES + EN)
+  KokoroEngine      → motor primario CPU/GPU (ef_dora ES, af_bella EN)
+  PiperEngine       → fallback con proceso persistente warm-pool
 
 FONÉTICA:
   No está hardcodeada aquí.
@@ -50,8 +50,6 @@ class TextPreprocessor:
     La fonética técnica se carga desde un archivo JSON externo.
     """
 
-    # Sustituciones de unidades numéricas — estas sí van aquí
-    # porque son invariantes de dominio, no específicas del laboratorio
     _UNIT_SUBS = [
         (r'\b(\d+(?:\.\d+)?)\s*°C\b',  r'\1 grados Celsius'),
         (r'\b(\d+(?:\.\d+)?)\s*°F\b',  r'\1 grados Fahrenheit'),
@@ -66,15 +64,20 @@ class TextPreprocessor:
         (r'\b(\d+(?:\.\d+)?)\s*W\b',   r'\1 vatios'),
         (r'\b(\d+(?:\.\d+)?)\s*%\b',   r'\1 por ciento'),
     ]
+    # R-2: compilar unit subs una sola vez al definir la clase
+    _COMPILED_UNIT_SUBS = [
+        (re.compile(p, re.IGNORECASE), r) for p, r in _UNIT_SUBS
+    ]
 
     def __init__(self):
-        self._phonetic_map: dict[str, str] = {}
+        # R-2: lista de (Pattern compilado, reemplazo) actualizada en load_phonetic_map()
+        self._compiled_phonetics: list[tuple[re.Pattern, str]] = []
         self.load_phonetic_map()
 
     # ── PUERTA_RAG ────────────────────────────────────────────────────────
     def load_phonetic_map(self) -> None:
         """
-        Carga knowledge_base/phonetic_map.json en memoria.
+        Carga knowledge_base/phonetic_map.json en memoria y compila los patrones.
 
         PUERTA_RAG — integración futura con el pipeline RAG:
           Cuando ingest_kb.py indexe nuevos documentos del laboratorio,
@@ -92,23 +95,26 @@ class TextPreprocessor:
         if not os.path.exists(PHONETIC_MAP_PATH):
             self._bootstrap_phonetic_map()
 
+        raw_map: dict[str, str] = {}
         try:
             with open(PHONETIC_MAP_PATH, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            # Excluir claves de comentario (_comment, _version, etc.)
-            self._phonetic_map = {
-                k: v for k, v in raw.items() if not k.startswith("_")
-            }
-            print(f"[TTS]  Fonética: {len(self._phonetic_map)} términos cargados")
+            raw_map = {k: v for k, v in raw.items() if not k.startswith("_")}
+            print(f"[TTS]  Fonética: {len(raw_map)} términos cargados")
         except Exception as e:
             print(f"[TTS]  ⚠ phonetic_map.json no se pudo cargar: {e}")
-            self._phonetic_map = {}
+
+        # R-2: compilar patrones en load_phonetic_map(), no en cada speak().
+        # Los patrones inválidos se registran con la clave exacta para diagnóstico.
+        compiled = []
+        for key, phonetic in raw_map.items():
+            try:
+                compiled.append((re.compile(key, re.IGNORECASE), phonetic))
+            except re.error as exc:
+                print(f"[TTS]  ⚠ Patrón inválido en phonetic_map.json (clave='{key}'): {exc}")
+        self._compiled_phonetics = compiled
 
     def _bootstrap_phonetic_map(self) -> None:
-        """
-        Crea phonetic_map.json con términos base del laboratorio EAFIT.
-        Solo se ejecuta la primera vez. Después se edita el JSON directamente.
-        """
         os.makedirs(os.path.dirname(PHONETIC_MAP_PATH), exist_ok=True)
 
         base = {
@@ -161,7 +167,6 @@ class TextPreprocessor:
     # ── Pipeline de normalización ─────────────────────────────────────────
 
     def process(self, text: str) -> str:
-        """Aplica todas las capas de normalización en orden."""
         text = self._strip_markdown(text)
         text = self._expand_units(text)
         text = self._apply_phonetics(text)
@@ -184,16 +189,15 @@ class TextPreprocessor:
         return text
 
     def _expand_units(self, text: str) -> str:
-        for pattern, repl in self._UNIT_SUBS:
-            text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+        # R-2: usar patrones pre-compilados a nivel de clase
+        for pattern, repl in self._COMPILED_UNIT_SUBS:
+            text = pattern.sub(repl, text)
         return text
 
     def _apply_phonetics(self, text: str) -> str:
-        for pattern, phonetic in self._phonetic_map.items():
-            try:
-                text = re.sub(pattern, phonetic, text, flags=re.IGNORECASE)
-            except re.error:
-                pass   # Patrón inválido en el JSON — ignorar
+        # R-2: patrones pre-compilados en load_phonetic_map(), cero compilación aquí
+        for pattern, phonetic in self._compiled_phonetics:
+            text = pattern.sub(phonetic, text)
         return text
 
     def _fix_punctuation(self, text: str) -> str:
@@ -219,8 +223,7 @@ class TextPreprocessor:
 class LanguageDetector:
     """
     Detecta si el texto es ES o EN.
-    Usa langdetect si está disponible (pip install langdetect).
-    Cae a heurística de palabras comunes si no.
+    Usa langdetect si está disponible; cae a heurística de palabras comunes.
     """
 
     _EN_WORDS = frozenset([
@@ -243,7 +246,6 @@ class LanguageDetector:
                   "(pip install langdetect para mayor precisión)")
 
     def detect(self, text: str) -> str:
-        """Devuelve 'es' o 'en'."""
         if len(text.strip()) < 10:
             return "es"
         if self._use_langdetect:
@@ -263,9 +265,15 @@ class LanguageDetector:
 
 class KokoroEngine:
     """
-    Kokoro-82M ONNX en CPU.
+    Kokoro-82M ONNX.
     ef_dora → femenina latinoamericana (contexto EAFIT Colombia)
-    af_bella → inglés americano (frases o términos en inglés)
+    af_bella → inglés americano
+
+    H-3: Intenta CUDAExecutionProvider primero (GPU libre durante TTS en el
+    sistema de relevos). Cae a CPU si el proveedor CUDA no está disponible o
+    si onnxruntime-gpu no está instalado.
+    IMPORTANTE: solo activar H-3 si C-2 (OLLAMA_KEEP_ALIVE_S > 0) está
+    configurado correctamente; de lo contrario Qwen puede seguir en VRAM.
     """
 
     VOICE_ES = "ef_dora"
@@ -276,8 +284,18 @@ class KokoroEngine:
             raise FileNotFoundError(f"Kokoro model: {model_path}")
         if not os.path.exists(voices_path):
             raise FileNotFoundError(f"Kokoro voices: {voices_path}")
+
         from kokoro_onnx import Kokoro
-        self._kokoro = Kokoro(model_path, voices_path)
+
+        # H-3: preferir GPU si onnxruntime-gpu está instalado y la VRAM está libre
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        try:
+            self._kokoro = Kokoro(model_path, voices_path, providers=providers)
+            print("[TTS]  Kokoro: intentando CUDAExecutionProvider")
+        except TypeError:
+            # kokoro_onnx version que no acepta providers → CPU
+            self._kokoro = Kokoro(model_path, voices_path)
+            print("[TTS]  ⚠ kokoro_onnx no acepta providers — usando CPU")
 
     def synthesize(self, text: str, lang: str = "es") -> tuple[np.ndarray, int]:
         voice     = self.VOICE_ES if lang == "es" else self.VOICE_EN
@@ -292,9 +310,13 @@ class KokoroEngine:
 
 class PiperEngine:
     """
-    Fallback monolingüe.
-    El texto ya llega con fonética corregida desde TextPreprocessor,
-    así que Piper ES puede pronunciar términos técnicos correctamente.
+    Fallback monolingüe con warm-pool de procesos (R-3).
+
+    R-3: Mantiene un proceso Piper pre-calentado por idioma.
+    Tras cada síntesis se reabre un proceso de reemplazo en paralelo con
+    la reproducción de audio, ocultando el costo del ELF loader detrás
+    del tiempo de playback. El proceso de reemplazo está listo cuando
+    llega la siguiente llamada.
     """
 
     def __init__(self, es_model: str, en_model: str):
@@ -307,15 +329,51 @@ class PiperEngine:
         if not self._en:
             print("[TTS]  ⚠ Piper EN no encontrado")
 
-    def synthesize(self, text: str, lang: str = "es") -> tuple[np.ndarray, int]:
-        model  = (self._en if lang == "en" and self._en else None) or self._es or self._en
-        result = subprocess.run(
+        # R-3: procesos warm por idioma; None → se crea en la primera llamada
+        self._warm: dict[str, Optional[subprocess.Popen]] = {"es": None, "en": None}
+        # Pre-calentar el idioma primario (ES)
+        if self._es:
+            self._warm["es"] = self._spawn("es")
+
+    def _model_for(self, lang: str) -> Optional[str]:
+        return (self._en if lang == "en" and self._en else None) or self._es or self._en
+
+    def _spawn(self, lang: str) -> Optional[subprocess.Popen]:
+        model = self._model_for(lang)
+        if model is None:
+            return None
+        return subprocess.Popen(
             ["piper", "--model", model, "--output-raw"],
-            input=text.encode("utf-8"),
-            capture_output=True,
-            check=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
-        audio = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+
+    def synthesize(self, text: str, lang: str = "es") -> tuple[np.ndarray, int]:
+        proc = self._warm.get(lang)
+        if proc is None or proc.poll() is not None:
+            proc = self._spawn(lang)
+
+        try:
+            raw, _ = proc.communicate(
+                input=text.encode("utf-8"),
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raw, _ = proc.communicate()
+        except Exception as e:
+            print(f"[TTS]  ⚠ Piper communicate falló ({e}) — reintentando")
+            raw = b""
+
+        # R-3: spawn del proceso de reemplazo en background antes de convertir audio
+        # El proceso estará listo cuando termine la reproducción de este turno.
+        self._warm[lang] = self._spawn(lang)
+
+        if not raw:
+            raise RuntimeError("Piper no produjo audio")
+
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
         return audio, 22050
 
 
@@ -348,7 +406,7 @@ class AntoniaTTS:
         try:
             self._kokoro      = KokoroEngine(KOKORO_MODEL, KOKORO_VOICES)
             self._engine_name = "kokoro"
-            print("[TTS]  ✅ Kokoro-82M cargado (CPU)")
+            print("[TTS]  ✅ Kokoro-82M cargado")
         except Exception as e:
             print(f"[TTS]  ⚠ Kokoro no disponible: {e}")
 
@@ -356,7 +414,7 @@ class AntoniaTTS:
             self._piper = PiperEngine(PIPER_ES_MODEL, PIPER_EN_MODEL)
             if self._engine_name is None:
                 self._engine_name = "piper"
-            print("[TTS]  ✅ Piper cargado como fallback (CPU)")
+            print("[TTS]  ✅ Piper cargado como fallback (warm-pool)")
         except Exception as e:
             print(f"[TTS]  ⚠ Piper no disponible: {e}")
 
@@ -376,15 +434,6 @@ class AntoniaTTS:
         """
         Sintetiza y reproduce texto.
         Acepta el output crudo del LLM — el preprocesador limpia el markdown.
-
-        Args:
-            text:         Texto a sintetizar (markdown OK, se limpia internamente).
-            save_wav:     True → guarda WAV en tests/ (debug SSH).
-            wav_filename: Nombre del WAV si save_wav=True.
-            play_audio:   False → solo genera WAV, no reproduce por altavoz.
-
-        Returns:
-            Ruta al WAV guardado, o None.
         """
         if not text or not text.strip():
             print("[TTS]  ⚠ Texto vacío.")
@@ -396,8 +445,8 @@ class AntoniaTTS:
         if not processed:
             return None
 
-        lang             = self.detector.detect(processed)
-        samples, sr      = self._synthesize(processed, lang)
+        lang        = self.detector.detect(processed)
+        samples, sr = self._synthesize(processed, lang)
 
         if samples is None:
             print("[TTS]  ❌ Síntesis fallida.")
@@ -439,7 +488,6 @@ class AntoniaTTS:
 
 
 # ── Instancia global ───────────────────────────────────────────────────────
-# Importar desde el orquestador: from modules.tts.tts_module import tts
 try:
     tts = AntoniaTTS()
 except RuntimeError as e:

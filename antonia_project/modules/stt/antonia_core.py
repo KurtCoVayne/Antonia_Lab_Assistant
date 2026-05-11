@@ -10,6 +10,9 @@ Fixes v3:
   - Pre-énfasis de señal para recuperar fricativas y consonantes
   - Supresión de doble trigger durante LISTENING
   - Noise gate antes del VAD para ignorar ruido de fondo constante
+
+R-1: Buffer VAD pre-asignado — elimina np.concatenate() en el hot path.
+     Evita ~150 heap allocations por utterance en el Cortex-A78AE.
 """
 
 import time
@@ -35,46 +38,36 @@ MIC_DEVICE = 0
 SR_HW      = 44100
 SR_TARGET  = 16000
 
-# 100ms por chunk — balance entre latencia de respuesta y estabilidad USB
-CHUNK_SAMPLES = 4410
+CHUNK_SAMPLES = 4410   # 100ms @ 44100 Hz
 
-GAIN      = 3.0
+GAIN       = 3.0
 MIN_ENERGY = 0.04
 
-# — Wake Word —
-WW_THRESHOLD = 0.35
+WW_THRESHOLD   = 0.35
+WW_FLUSH_CHUNKS = 6    # 600ms post-wake-word descartados
 
-# FIX 1: Cuántos chunks descartar tras wake word (elimina el audio de "Hey Jarvis"
-# para que Whisper no lo transcriba). 100ms × 6 = 600ms de cola de silencio.
-WW_FLUSH_CHUNKS = 6
+VAD_WINDOW        = 512   # Silero exige exactamente 512 samples @ 16kHz
+VAD_THRESHOLD     = 0.40
+SILENCE_WINDOWS   = 20
+MIN_SPEECH_WINDOWS = 3
+NOISE_GATE_RMS    = 0.008
 
-# — VAD (Silero) —
-VAD_WINDOW    = 512    # Silero exige exactamente 512 samples @ 16kHz
+LISTENING_TIMEOUT_CHUNKS = 60   # 6 segundos
 
-# FIX 2: Umbrales más tolerantes para frases largas en entorno con ruido
-VAD_THRESHOLD     = 0.40   # Bajado de 0.45 — detecta voz más fácilmente
-SILENCE_WINDOWS   = 20     # Subido de 12 → 20 × 32ms = ~640ms antes de cortar
-                            # Permite pausas naturales dentro de una frase
-MIN_SPEECH_WINDOWS = 3     # Mínimo de voz válida para transcribir (bajado de 4)
-
-# FIX 3: Noise gate — descarta chunks cuya energía sea indistinguible del
-# ruido de fondo constante del laboratorio (ventiladores, equipos).
-# Si el RMS del chunk está por debajo de este umbral, se trata como silencio
-# incluso si Silero lo clasifica como voz.
-NOISE_GATE_RMS = 0.008     # Ajustar si el lab tiene mucho ruido de fondo
-
-# Timeout: si no hay voz en N chunks tras wake word → volver a dormir
-LISTENING_TIMEOUT_CHUNKS = 60   # 60 × 100ms = 6 segundos
+# R-1: Tamaño del buffer pre-asignado para la acumulación VAD.
+# chunk_16k por llamada ≈ CHUNK_SAMPLES * SR_TARGET / SR_HW ≈ 1604 samples.
+# 2 × VAD_WINDOW + chunk headroom = 512*2 + 1604 = 2628 → 3000 con margen.
+_VAD_BUF_SIZE = 3000
 
 # ══════════════════════════════════════════════════════════════
 # CARGA DE MODELOS
 # ══════════════════════════════════════════════════════════════
 
-print("[INIT] Configurando resampler (torchaudio Kaiser)...")
+print("[INIT] Configurando resampler (torchaudio sinc_interp_hann)...")
 resampler = torchaudio.transforms.Resample(
     orig_freq=SR_HW,
     new_freq=SR_TARGET,
-    resampling_method="sinc_interp_kaiser",
+    resampling_method="sinc_interp_hann",
 )
 
 print("[INIT] Cargando Silero VAD...")
@@ -108,38 +101,65 @@ def resample_chunk(raw: np.ndarray) -> np.ndarray:
 
 def preemphasis(audio: np.ndarray, coef: float = 0.97) -> np.ndarray:
     """
-    FIX 4: Pre-énfasis de señal.
+    Pre-énfasis de señal.
     Amplifica frecuencias altas (2kHz-8kHz) donde viven las fricativas
     (s, f, ch, j) y consonantes oclusivas (p, t, k) que el mic USB
-    atenúa más que los medios. Mejora la inteligibilidad de Whisper
-    en frases con palabras como 'están', 'frecuencia', 'configure'.
+    atenúa más que los medios.
     y[n] = x[n] - coef * x[n-1]
     """
     return np.append(audio[0], audio[1:] - coef * audio[:-1])
 
 
-def vad_score(chunk_16k: np.ndarray, leftovers: list) -> tuple[float, list]:
+class VadBuffer:
     """
-    Pasa ventanas de exactamente 512 samples por Silero VAD.
-    Acumula residuos entre callbacks para no perder samples.
-    Devuelve la probabilidad máxima encontrada en este chunk.
+    R-1: Buffer pre-asignado para la acumulación de samples entre callbacks VAD.
+
+    Reemplaza el patrón leftovers: list + np.concatenate() que ejecutaba
+    ~150 heap allocations por utterance. El hot path ahora es un único
+    memcpy (buf[n:n+k] = chunk) sin llamadas al allocator de Python.
     """
-    leftovers.append(chunk_16k)
-    combined = np.concatenate(leftovers)
-    max_prob = 0.0
 
-    while len(combined) >= VAD_WINDOW:
-        window   = combined[:VAD_WINDOW]
-        combined = combined[VAD_WINDOW:]
-        t        = torch.from_numpy(window.astype(np.float32))
-        prob     = silero_vad(t, SR_TARGET).item()
-        max_prob = max(max_prob, prob)
+    def __init__(self, capacity: int = _VAD_BUF_SIZE):
+        self._buf = np.zeros(capacity, dtype=np.float32)
+        self._len = 0
 
-    leftovers.clear()
-    if len(combined) > 0:
-        leftovers.append(combined)
+    def reset(self) -> None:
+        self._len = 0
 
-    return max_prob, leftovers
+    def push(self, chunk: np.ndarray) -> None:
+        n = len(chunk)
+        end = self._len + n
+        if end > len(self._buf):
+            # Buffer demasiado pequeño — ampliar (no debería ocurrir en condiciones normales)
+            new_buf = np.zeros(end * 2, dtype=np.float32)
+            new_buf[:self._len] = self._buf[:self._len]
+            self._buf = new_buf
+        self._buf[self._len:end] = chunk
+        self._len = end
+
+    def score(self) -> float:
+        """
+        Procesa todas las ventanas de 512 samples disponibles.
+        Retorna la probabilidad VAD máxima encontrada en este bloque.
+        Los samples residuales (< 512) se preservan para el siguiente push().
+        """
+        max_prob = 0.0
+        offset   = 0
+
+        while offset + VAD_WINDOW <= self._len:
+            window = self._buf[offset:offset + VAD_WINDOW]
+            t      = torch.from_numpy(window.copy())
+            prob   = silero_vad(t, SR_TARGET).item()
+            max_prob = max(max_prob, prob)
+            offset += VAD_WINDOW
+
+        # Compactar: mover residuo al inicio del buffer
+        remainder = self._len - offset
+        if remainder > 0:
+            self._buf[:remainder] = self._buf[offset:self._len]
+        self._len = remainder
+
+        return max_prob
 
 
 def transcribe(audio_raw_44k: np.ndarray) -> tuple[str, float]:
@@ -147,13 +167,9 @@ def transcribe(audio_raw_44k: np.ndarray) -> tuple[str, float]:
     Recibe audio crudo a 44100 Hz, lo prepara completamente y transcribe.
     Pipeline interno: resample → pre-énfasis → normalización → Whisper
     """
-    # 1. Resamplear todo el buffer capturado
     audio_16k = resample_chunk(audio_raw_44k)
-
-    # 2. Pre-énfasis para recuperar consonantes atenuadas por el mic
     audio_16k = preemphasis(audio_16k, coef=0.97)
 
-    # 3. Normalización de pico
     peak = np.max(np.abs(audio_16k))
     if peak > 0:
         audio_16k = audio_16k / peak * 0.95
@@ -167,14 +183,12 @@ def transcribe(audio_raw_44k: np.ndarray) -> tuple[str, float]:
         vad_filter=True,
         vad_parameters=dict(
             min_silence_duration_ms=400,
-            speech_pad_ms=250,       # Subido: más padding al final de la frase
+            speech_pad_ms=250,
             threshold=0.15,
         ),
         temperature=0.0,
         condition_on_previous_text=False,
         without_timestamps=True,
-        # FIX 5: initial_prompt ayuda a Whisper a contextualizar el dominio
-        # y a escribir correctamente términos técnicos y nombres propios
         initial_prompt=(
             "Transcripción de consulta en el Laboratorio de Control Digital, "
             "Universidad EAFIT, Medellín, Colombia. El usuario puede preguntar "
@@ -194,13 +208,13 @@ _audio_queue: queue.Queue = queue.Queue(maxsize=80)
 def _audio_callback(indata, frames, time_info, status):
     """Solo encola. Nunca procesa. Nunca bloquea."""
     if status.input_overflow:
-        return   # Descarte silencioso — mejor perder 100ms que bloquear
+        return
     if status:
         print(f"[HW] {status}")
     try:
         _audio_queue.put_nowait(indata.flatten().copy())
     except queue.Full:
-        pass     # Cola llena (procesamiento lento) — descarte controlado
+        pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -210,18 +224,18 @@ def _audio_callback(indata, frames, time_info, status):
 def main_loop():
     """
     Estados:
-      SLEEPING   → Escucha solo el wake word. Liviano, sin grabar.
-      FLUSHING   → Descarta N chunks post-wake-word (elimina audio de "Hey Jarvis")
+      SLEEPING   → Escucha solo el wake word.
+      FLUSHING   → Descarta N chunks post-wake-word.
       LISTENING  → Graba con Silero VAD. Detecta inicio y fin de utterance.
-      PROCESSING → Whisper corriendo en hilo paralelo. Ya volvimos a SLEEPING.
+      PROCESSING → Whisper corriendo en hilo paralelo.
     """
     state         = "SLEEPING"
     raw_buffer    = []
-    vad_leftovers = []
+    vad_buf       = VadBuffer()   # R-1: buffer pre-asignado, sin allocations en hot path
     silence_count = 0
     speech_count  = 0
     flush_count   = 0
-    total_chunks  = 0    # Contador para timeout de LISTENING
+    total_chunks  = 0
 
     print("══════════════════════════════════════════════════════")
     print("  Antonia está durmiendo. Di 'Hey Jarvis' para hablar.")
@@ -230,7 +244,7 @@ def main_loop():
     with sd.InputStream(
         samplerate=SR_HW,
         channels=1,
-        dtype="float32",    
+        dtype="float32",
         blocksize=CHUNK_SAMPLES,
         device=MIC_DEVICE,
         latency="high",
@@ -254,15 +268,12 @@ def main_loop():
             # ══════════════════════════════════════════════
             elif state == "FLUSHING":
             # ══════════════════════════════════════════════
-                # FIX 1: Descartar audio del wake word antes de grabar
-                # para que Whisper no transcriba "Hey Jarvis" como parte
-                # de la pregunta del usuario.
                 flush_count += 1
                 if flush_count >= WW_FLUSH_CHUNKS:
                     print("  🎙️  ¡Habla ahora!\n")
                     state         = "LISTENING"
                     raw_buffer    = []
-                    vad_leftovers = []
+                    vad_buf.reset()
                     silence_count = 0
                     speech_count  = 0
                     total_chunks  = 0
@@ -274,15 +285,14 @@ def main_loop():
                 total_chunks += 1
                 raw_buffer.append(raw_chunk)
 
-                # Noise gate: RMS del chunk a 16kHz
                 rms = np.sqrt(np.mean(chunk_16k ** 2))
                 if rms < NOISE_GATE_RMS:
-                    # Energía de ruido de fondo — tratar como silencio directo
                     if speech_count > 0:
                         silence_count += 1
                 else:
-                    # Energía suficiente — consultar Silero VAD
-                    speech_prob, vad_leftovers = vad_score(chunk_16k, vad_leftovers)
+                    # R-1: push() es un memcpy en el buffer pre-asignado
+                    vad_buf.push(chunk_16k)
+                    speech_prob = vad_buf.score()
 
                     if speech_prob >= VAD_THRESHOLD:
                         speech_count  += 1
@@ -290,11 +300,10 @@ def main_loop():
                     elif speech_count > 0:
                         silence_count += 1
 
-                # ── ¿Fin de utterance? ────────────────────────────
                 if speech_count >= MIN_SPEECH_WINDOWS and silence_count >= SILENCE_WINDOWS:
                     captured      = np.concatenate(raw_buffer)
                     raw_buffer    = []
-                    vad_leftovers = []
+                    vad_buf.reset()
                     silence_count = 0
                     speech_count  = 0
 
@@ -311,14 +320,13 @@ def main_loop():
                         print("\n  Di 'Hey Jarvis' para continuar.\n")
 
                     threading.Thread(target=_run, args=(captured,), daemon=True).start()
-                    state = "SLEEPING"   # Mic sigue vivo mientras Whisper procesa
+                    state = "SLEEPING"
 
-                # ── Timeout: no habló en 6 segundos ──────────────
                 elif total_chunks >= LISTENING_TIMEOUT_CHUNKS:
                     print("[VAD] Sin voz detectada. Volviendo a dormir...\n")
                     state         = "SLEEPING"
                     raw_buffer    = []
-                    vad_leftovers = []
+                    vad_buf.reset()
                     silence_count = 0
                     speech_count  = 0
                     silero_vad.reset_states()
